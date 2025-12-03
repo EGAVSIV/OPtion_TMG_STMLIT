@@ -1,142 +1,175 @@
 import streamlit as st
-import pandas as pd
-import requests
-from tvDatafeed import TvDatafeed, Interval
-from io import StringIO
+import swisseph as swe
+import datetime, pytz, math
 
-st.set_page_config(page_title="OI Decay Scanner", layout="wide")
+st.set_page_config(page_title="🪐 वेदिक ग्रह घड़ी — वेब संस्करण", layout="wide")
 
-st.title("📉 %OI Decay Scanner — ITM 1–2 Strikes (CALL & PUT)")
+# -----------------------------
+# ASTRO DATA
+# -----------------------------
+SIGNS = ["मेष","वृषभ","मिथुन","कर्क","सिंह","कन्या",
+         "तुला","वृश्चिक","धनु","मकर","कुंभ","मीन"]
 
-# -------------------------------------------------------
-# tvDatafeed login
-# -------------------------------------------------------
-username = "GauravSinghYadav"
-password = "Eric$1234"
+NAKSHATRAS = [
+("अश्विनी","केतु"),("भरणी","शुक्र"),("कृत्तिका","सूर्य"),
+("रोहिणी","चन्द्र"),("मृगशिरा","मंगल"),("आर्द्रा","राहु"),
+("पुनर्वसु","बृहस्पति"),("पुष्य","शनि"),("आश्लेषा","बुध"),
+("मघा","केतु"),("पूर्व फाल्गुनी","शुक्र"),("उत्तर फाल्गुनी","सूर्य"),
+("हस्त","चन्द्र"),("चित्रा","मंगल"),("स्वाति","राहु"),
+("विशाखा","बृहस्पति"),("अनुराधा","शनि"),("ज्येष्ठा","बुध"),
+("मूला","केतु"),("पूर्वाषाढा","शुक्र"),("उत्तराषाढा","सूर्य"),
+("श्रवण","चन्द्र"),("धनिष्ठा","मंगल"),("शतभिषा","राहु"),
+("पूर्वभाद्रपदा","बृहस्पति"),("उत्तरभाद्रपदा","शनि"),("रेवती","बुध")
+]
 
-try:
-    tv = TvDatafeed(username=username, password=password)
-except:
-    st.error("❌ TV login failed — check credentials")
-    st.stop()
+PLANETS = [
+("सूर्य", swe.SUN, "🜚"),
+("चन्द्र", swe.MOON,"☽"),
+("मंगल", swe.MARS,"♂"),
+("बुध", swe.MERCURY,"☿"),
+("बृहस्पति", swe.JUPITER,"♃"),
+("शुक्र", swe.VENUS,"♀"),
+("शनि", swe.SATURN,"♄"),
+("राहु", swe.MEAN_NODE,"☊")
+]
 
-# -------------------------------------------------------
-# Symbol selection
-# -------------------------------------------------------
-symbols = sorted([
-    'BANKNIFTY','NIFTY','FINNIFTY','CNXFINANCE','CNXMIDCAP',
-    'RELIANCE','ICICIBANK','HDFCBANK','SBIN','TATAMOTORS',
-    'TCS','INFY','AXISBANK','HCLTECH','LT','ITC'
-])
+COL = {
+"सूर्य":"#ffcc66","चन्द्र":"#cce6ff","मंगल":"#ff9999",
+"बुध":"#ccffcc","बृहस्पति":"#ffe6b3","शुक्र":"#ffccff",
+"शनि":"#c2c2ff","राहु":"#ffd27f","केतु":"#ffd27f"
+}
 
-selected_symbols = st.multiselect("Select Symbols", symbols, default=["NIFTY","BANKNIFTY"])
+swe.set_sid_mode(swe.SIDM_LAHIRI,0,0)
 
-DECAY_LIMIT = st.number_input("Decay % Threshold (Default -30%)", -100, 0, -30)
+# -----------------------------
+# ASTRO FUNCTIONS
+# -----------------------------
 
-# -------------------------------------------------------
-# Fetch Close Price
-# -------------------------------------------------------
-def get_close(symbol):
-    try:
-        df = tv.get_hist(symbol=symbol, exchange='NSE', interval=Interval.in_daily, n_bars=2)
-        return float(df.close.iloc[-1])
-    except:
-        return None
+def get_positions(dt):
+    jd = swe.julday(dt.year, dt.month, dt.day,
+                    dt.hour + dt.minute/60) - 5.5/24
+    pos = {}
+    for name, code, sym in PLANETS:
+        r = swe.calc_ut(jd, code)
+        ay = swe.get_ayanamsa_ut(jd)
+        pos[name] = (r[0][0] - ay) % 360
 
-# -------------------------------------------------------
-# Fetch Option Chain (Without Selenium)
-# -------------------------------------------------------
-def get_option_chain(symbol):
-    url = f"https://www.niftytrader.in/nse-option-chain/{symbol}"
-    response = requests.get(url)
+    pos["केतु"] = (pos["राहु"] + 180) % 360
+    return pos
 
-    if response.status_code != 200:
-        return None
 
-    try:
-        df = pd.read_html(StringIO(response.text))[0]
-        df.columns = [str(c).strip() for c in df.columns]
-        return df
-    except:
-        return None
+def nakshatra_of(lon):
+    size = 13 + 1/3
+    idx = int(lon // size) % 27
+    return NAKSHATRAS[idx][0]
 
-# -------------------------------------------------------
-# Extract Clean OI Columns
-# -------------------------------------------------------
-def process_oc(df):
-    df['Strike'] = pd.to_numeric(df['Strike Price'].astype(str).str.replace(",", ""), errors='coerce')
+# -----------------------------
+# SVG GENERATOR (Perfect Circles)
+# -----------------------------
 
-    df['CE_OI_%'] = df['OI (Chg %)'].astype(str).str.extract(r"\((.*?)\)").iloc[:,0]
-    df['PE_OI_%'] = df['OI (Chg %).1'].astype(str).str.extract(r"\((.*?)\)").iloc[:,0]
+def generate_svg(pos):
 
-    df['CE_OI_%'] = pd.to_numeric(df['CE_OI_%'].str.replace("%",""), errors="ignore")
-    df['PE_OI_%'] = pd.to_numeric(df['PE_OI_%'].str.replace("%",""), errors="ignore")
+    svg = """
+    <svg width="700" height="700" viewBox="0 0 700 700" style="display:block;margin:auto">
 
-    df = df.dropna(subset=["Strike"])
-    return df
+        <!-- Outer Glow Ring -->
+        <defs>
+            <radialGradient id="outerGlow" cx="50%" cy="50%" r="50%">
+                <stop offset="60%" stop-color="#0d1b2a"/>
+                <stop offset="95%" stop-color="#4da6ff"/>
+                <stop offset="100%" stop-color="#99ccff"/>
+            </radialGradient>
+        </defs>
 
-# -------------------------------------------------------
-# ITM 1–2 Strike Filter Logic
-# -------------------------------------------------------
-def filter_itm_strikes(df, close):
-    df = df.sort_values("Strike")
+        <circle cx="350" cy="350" r="330" fill="url(#outerGlow)" stroke="#222" stroke-width="2"/>
 
-    # nearest ATM
-    atm = df.iloc[(df["Strike"] - close).abs().argsort()].iloc[0]["Strike"]
+        <!-- Inner Circle -->
+        <circle cx="350" cy="350" r="270" fill="#0a0f1e" stroke="#666" stroke-width="2"/>
 
-    # ITM CALL = strikes BELOW LTP
-    # ITM PUT = strikes ABOVE LTP  
-    itm_calls = df[df.Strike < close].tail(2)     # ITM 1–2 CALL
-    itm_puts  = df[df.Strike > close].head(2)     # ITM 1–2 PUT
+        <!-- Center Text -->
+        <text x="350" y="340" fill="white" font-size="30" text-anchor="middle">वेदिक घड़ी</text>
+        <text x="350" y="370" fill="#cccccc" font-size="18" text-anchor="middle">(लाहिड़ी अयनांश)</text>
 
-    return itm_calls, itm_puts, atm
+        <!-- Zodiac Divisions -->
+    """
 
-# -------------------------------------------------------
-# MAIN
-# -------------------------------------------------------
-final_output = []
+    # Draw 12 radial lines + zodiac names
+    for i in range(12):
+        ang = math.radians(90 - (i*30))
+        x = 350 + 260 * math.cos(ang)
+        y = 350 - 260 * math.sin(ang)
 
-for sym in selected_symbols:
-    st.subheader(f"📌 {sym}")
+        svg += f"""
+        <line x1="350" y1="350" x2="{x}" y2="{y}"
+              stroke="#f7d000" stroke-width="3"/>
 
-    close_price = get_close(sym)
-    if close_price is None:
-        st.error(f"❌ Could not fetch close price for {sym}")
-        continue
+        <text x="{350 + 200 * math.cos(ang)}"
+              y="{350 - 200 * math.sin(ang)}"
+              fill="#00e6ff" font-size="24" text-anchor="middle"
+              dominant-baseline="middle">{SIGNS[i]}</text>
+        """
 
-    df = get_option_chain(sym)
-    if df is None:
-        st.error(f"❌ Option chain not found for {sym}")
-        continue
+    # Planets
+    for name, code, sym in PLANETS:
+        lon = pos[name]
+        ang = math.radians(90 - lon)
 
-    df = process_oc(df)
-    itm_calls, itm_puts, atm = filter_itm_strikes(df, close_price)
+        px = 350 + 210 * math.cos(ang)
+        py = 350 - 210 * math.sin(ang)
 
-    st.write(f"**Close Price:** {close_price} | **ATM Strike:** {atm}")
+        nak = nakshatra_of(lon)
+        color = COL[name]
 
-    # Filter decay
-    calls_filtered = itm_calls[itm_calls['CE_OI_%'] <= DECAY_LIMIT]
-    puts_filtered  = itm_puts[itm_puts['PE_OI_%'] <= DECAY_LIMIT]
+        svg += f"""
+        <circle cx="{px}" cy="{py}" r="28" fill="{color}" stroke="black" stroke-width="2"/>
 
-    st.write("### 📉 ITM CALL (1–2 Strikes) — Decay Filter")
-    st.dataframe(calls_filtered)
+        <text x="{px}" y="{py}" font-size="22" font-weight="bold"
+              text-anchor="middle" dominant-baseline="middle">{sym}</text>
 
-    st.write("### 📉 ITM PUT (1–2 Strikes) — Decay Filter")
-    st.dataframe(puts_filtered)
+        <text x="{px}" y="{py + 42}" fill="white" font-size="18"
+              text-anchor="middle">{name}</text>
 
-    # Combine to save later
-    calls_filtered["Symbol"] = sym
-    puts_filtered["Symbol"]  = sym
-    final_output.append(calls_filtered)
-    final_output.append(puts_filtered)
+        <text x="{px}" y="{py - 42}" fill="#ffeb99" font-size="16"
+              text-anchor="middle">{nak}</text>
+        """
 
-# -------------------------------------------------------
-# Save Excel
-# -------------------------------------------------------
-if final_output:
-    result = pd.concat(final_output, ignore_index=True)
-    st.download_button(
-        label="📥 Download Excel",
-        data=result.to_excel(index=False),
-        file_name="oi_decay_filtered.xlsx"
-    )
+    svg += "</svg>"
+    return svg
+
+# -----------------------------
+# STREAMLIT UI
+# -----------------------------
+
+st.title("🪐 वेदिक ग्रह घड़ी — Circular Chakra (HTML Version)")
+
+col1, col2, col3 = st.columns(3)
+
+date = col1.date_input("तारीख़ चुनें")
+time = col2.time_input("समय चुनें")
+
+if col3.button("अब"):
+    now = datetime.datetime.now(pytz.timezone("Asia/Kolkata"))
+    date, time = now.date(), now.time()
+
+dt = datetime.datetime.combine(date, time)
+pos = get_positions(dt)
+
+# Chakra Display
+svg = generate_svg(pos)
+st.components.v1.html(svg, height=720)
+
+# Table
+st.subheader("ग्रह तालिका")
+
+table = []
+for p, code, sym in PLANETS:
+    table.append([
+        p, sym,
+        f"{pos[p]:.2f}°",
+        SIGNS[int(pos[p]//30)],
+        nakshatra_of(pos[p])
+    ])
+
+st.table(table)
+
+st.success("समय (IST): " + dt.strftime("%d-%b-%Y %H:%M:%S"))
