@@ -8,8 +8,8 @@ from tvDatafeed import TvDatafeed, Interval
 # ======================================================
 # STREAMLIT CONFIG
 # ======================================================
-st.set_page_config(page_title="OI Decay OTM Scanner", layout="wide")
-st.title("📉 %OI Decay Scanner — OTM 1–2 Strikes (CALL & PUT)")
+st.set_page_config(page_title="📉OI Decay OTM Scanner", layout="wide")
+st.title("📉 %OI Decay Scanner — OTM 1–2 Strikes_By_Gs_Yadav")
 st.caption("Close Price: TradingView | Option Chain: NSE JSON API")
 
 # ======================================================
