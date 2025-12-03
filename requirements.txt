@@ -1,8 +1,7 @@
 streamlit
 pandas
-requests
-tradingview-datafeed
 numpy
+requests
 lxml
 bs4
 openpyxl
