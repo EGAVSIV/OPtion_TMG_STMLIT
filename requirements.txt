@@ -1,7 +1,7 @@
 streamlit
 pandas
 requests
-tvdatafeed
+tradingview-datafeed
 numpy
 lxml
 bs4
