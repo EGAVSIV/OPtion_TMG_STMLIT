@@ -1,0 +1,8 @@
+streamlit
+pandas
+requests
+tvdatafeed
+numpy
+lxml
+bs4
+openpyxl
