@@ -1,175 +1,382 @@
 import streamlit as st
-import swisseph as swe
-import datetime, pytz, math
+import pandas as pd
+import numpy as np
+import requests
+from io import StringIO, BytesIO
 
-st.set_page_config(page_title="🪐 वेदिक ग्रह घड़ी — वेब संस्करण", layout="wide")
+# ======================================================
+# STREAMLIT CONFIG
+# ======================================================
+st.set_page_config(
+    page_title="OI Decay ITM Scanner",
+    layout="wide",
+)
 
-# -----------------------------
-# ASTRO DATA
-# -----------------------------
-SIGNS = ["मेष","वृषभ","मिथुन","कर्क","सिंह","कन्या",
-         "तुला","वृश्चिक","धनु","मकर","कुंभ","मीन"]
+st.title("📉 % OI Decay Scanner — ITM 1–2 Strikes (CALL & PUT)")
+st.caption("ATM selection based on close price (NSE) + Option Chain from NiftyTrader")
 
-NAKSHATRAS = [
-("अश्विनी","केतु"),("भरणी","शुक्र"),("कृत्तिका","सूर्य"),
-("रोहिणी","चन्द्र"),("मृगशिरा","मंगल"),("आर्द्रा","राहु"),
-("पुनर्वसु","बृहस्पति"),("पुष्य","शनि"),("आश्लेषा","बुध"),
-("मघा","केतु"),("पूर्व फाल्गुनी","शुक्र"),("उत्तर फाल्गुनी","सूर्य"),
-("हस्त","चन्द्र"),("चित्रा","मंगल"),("स्वाति","राहु"),
-("विशाखा","बृहस्पति"),("अनुराधा","शनि"),("ज्येष्ठा","बुध"),
-("मूला","केतु"),("पूर्वाषाढा","शुक्र"),("उत्तराषाढा","सूर्य"),
-("श्रवण","चन्द्र"),("धनिष्ठा","मंगल"),("शतभिषा","राहु"),
-("पूर्वभाद्रपदा","बृहस्पति"),("उत्तरभाद्रपदा","शनि"),("रेवती","बुध")
-]
+# ======================================================
+# NSE FETCH HELPERS (UNOFFICIAL, BE CAREFUL FOR COMMERCIAL USE)
+# ======================================================
 
-PLANETS = [
-("सूर्य", swe.SUN, "🜚"),
-("चन्द्र", swe.MOON,"☽"),
-("मंगल", swe.MARS,"♂"),
-("बुध", swe.MERCURY,"☿"),
-("बृहस्पति", swe.JUPITER,"♃"),
-("शुक्र", swe.VENUS,"♀"),
-("शनि", swe.SATURN,"♄"),
-("राहु", swe.MEAN_NODE,"☊")
-]
-
-COL = {
-"सूर्य":"#ffcc66","चन्द्र":"#cce6ff","मंगल":"#ff9999",
-"बुध":"#ccffcc","बृहस्पति":"#ffe6b3","शुक्र":"#ffccff",
-"शनि":"#c2c2ff","राहु":"#ffd27f","केतु":"#ffd27f"
+NSE_HEADERS = {
+    "Connection": "keep-alive",
+    "Cache-Control": "max-age=0",
+    "DNT": "1",
+    "Upgrade-Insecure-Requests": "1",
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                  "AppleWebKit/537.36 (KHTML, like Gecko) "
+                  "Chrome/79.0.3945.79 Safari/537.36",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,"
+              "image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.9",
+    "Accept-Encoding": "gzip, deflate, br",
+    "Accept-Language": "en-US,en;q=0.9,hi;q=0.8",
 }
 
-swe.set_sid_mode(swe.SIDM_LAHIRI,0,0)
-
-# -----------------------------
-# ASTRO FUNCTIONS
-# -----------------------------
-
-def get_positions(dt):
-    jd = swe.julday(dt.year, dt.month, dt.day,
-                    dt.hour + dt.minute/60) - 5.5/24
-    pos = {}
-    for name, code, sym in PLANETS:
-        r = swe.calc_ut(jd, code)
-        ay = swe.get_ayanamsa_ut(jd)
-        pos[name] = (r[0][0] - ay) % 360
-
-    pos["केतु"] = (pos["राहु"] + 180) % 360
-    return pos
-
-
-def nakshatra_of(lon):
-    size = 13 + 1/3
-    idx = int(lon // size) % 27
-    return NAKSHATRAS[idx][0]
-
-# -----------------------------
-# SVG GENERATOR (Perfect Circles)
-# -----------------------------
-
-def generate_svg(pos):
-
-    svg = """
-    <svg width="700" height="700" viewBox="0 0 700 700" style="display:block;margin:auto">
-
-        <!-- Outer Glow Ring -->
-        <defs>
-            <radialGradient id="outerGlow" cx="50%" cy="50%" r="50%">
-                <stop offset="60%" stop-color="#0d1b2a"/>
-                <stop offset="95%" stop-color="#4da6ff"/>
-                <stop offset="100%" stop-color="#99ccff"/>
-            </radialGradient>
-        </defs>
-
-        <circle cx="350" cy="350" r="330" fill="url(#outerGlow)" stroke="#222" stroke-width="2"/>
-
-        <!-- Inner Circle -->
-        <circle cx="350" cy="350" r="270" fill="#0a0f1e" stroke="#666" stroke-width="2"/>
-
-        <!-- Center Text -->
-        <text x="350" y="340" fill="white" font-size="30" text-anchor="middle">वेदिक घड़ी</text>
-        <text x="350" y="370" fill="#cccccc" font-size="18" text-anchor="middle">(लाहिड़ी अयनांश)</text>
-
-        <!-- Zodiac Divisions -->
+def nsefetch_json(url: str):
     """
+    Helper similar to widely-used NSE scrapers:
+    - First try direct JSON GET
+    - If that fails, get homepage + retry (to set cookies)
+    """
+    try:
+        resp = requests.get(url, headers=NSE_HEADERS, timeout=10)
+        resp.raise_for_status()
+        return resp.json()
+    except Exception:
+        try:
+            with requests.Session() as s:
+                s.get("https://www.nseindia.com", headers=NSE_HEADERS, timeout=10)
+                resp = s.get(url, headers=NSE_HEADERS, timeout=10)
+                resp.raise_for_status()
+                return resp.json()
+        except Exception:
+            return None
 
-    # Draw 12 radial lines + zodiac names
-    for i in range(12):
-        ang = math.radians(90 - (i*30))
-        x = 350 + 260 * math.cos(ang)
-        y = 350 - 260 * math.sin(ang)
+def get_close_price(symbol: str):
+    """
+    Get close/ltp for symbol.
+    1️⃣ Try derivative quote (for F&O / indices) -> underlyingValue
+    2️⃣ Fallback to equity quote -> priceInfo.lastPrice
+    """
+    symbol = symbol.upper().strip()
 
-        svg += f"""
-        <line x1="350" y1="350" x2="{x}" y2="{y}"
-              stroke="#f7d000" stroke-width="3"/>
+    # Try derivative (works for indices + F&O stocks)
+    der_url = f"https://www.nseindia.com/api/quote-derivative?symbol={symbol}"
+    data = nsefetch_json(der_url)
+    if isinstance(data, dict):
+        uv = data.get("underlyingValue")
+        if uv is not None:
+            try:
+                return float(uv)
+            except Exception:
+                pass
 
-        <text x="{350 + 200 * math.cos(ang)}"
-              y="{350 - 200 * math.sin(ang)}"
-              fill="#00e6ff" font-size="24" text-anchor="middle"
-              dominant-baseline="middle">{SIGNS[i]}</text>
-        """
+    # Fallback to equity quote
+    eq_url = f"https://www.nseindia.com/api/quote-equity?symbol={symbol}"
+    data = nsefetch_json(eq_url)
+    if isinstance(data, dict):
+        price_info = data.get("priceInfo") or data.get("priceinfo") or {}
+        lp = price_info.get("lastPrice")
+        if lp is not None:
+            try:
+                return float(lp)
+            except Exception:
+                pass
 
-    # Planets
-    for name, code, sym in PLANETS:
-        lon = pos[name]
-        ang = math.radians(90 - lon)
+    return None
 
-        px = 350 + 210 * math.cos(ang)
-        py = 350 - 210 * math.sin(ang)
+# ======================================================
+# NIFTYTRADER OPTION CHAIN SCRAPER
+# ======================================================
 
-        nak = nakshatra_of(lon)
-        color = COL[name]
+NT_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                  "AppleWebKit/537.36 (KHTML, like Gecko) "
+                  "Chrome/122.0.0.0 Safari/537.36",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Referer": "https://www.niftytrader.in/",
+}
 
-        svg += f"""
-        <circle cx="{px}" cy="{py}" r="28" fill="{color}" stroke="black" stroke-width="2"/>
+def fetch_option_chain_niftytrader(symbol: str):
+    """
+    Fetch the main option-chain table from NiftyTrader HTML and return as cleaned DataFrame.
+    """
+    url = f"https://www.niftytrader.in/nse-option-chain/{symbol.upper()}"
+    try:
+        resp = requests.get(url, headers=NT_HEADERS, timeout=15)
+        resp.raise_for_status()
+    except Exception as e:
+        st.warning(f"{symbol}: Failed to fetch option chain page ({e})")
+        return None
 
-        <text x="{px}" y="{py}" font-size="22" font-weight="bold"
-              text-anchor="middle" dominant-baseline="middle">{sym}</text>
+    try:
+        tables = pd.read_html(resp.text)
+    except ValueError:
+        st.warning(f"{symbol}: No tables found on NiftyTrader page.")
+        return None
 
-        <text x="{px}" y="{py + 42}" fill="white" font-size="18"
-              text-anchor="middle">{name}</text>
+    if not tables:
+        st.warning(f"{symbol}: No tables parsed from NiftyTrader.")
+        return None
 
-        <text x="{px}" y="{py - 42}" fill="#ffeb99" font-size="16"
-              text-anchor="middle">{nak}</text>
-        """
+    df = tables[0]
 
-    svg += "</svg>"
-    return svg
+    # Flatten MultiIndex columns if present
+    if isinstance(df.columns, pd.MultiIndex):
+        df.columns = [
+            " ".join([str(x) for x in col if str(x) != "nan"]).strip()
+            for col in df.columns.values
+        ]
+    else:
+        df.columns = [str(c).strip() for c in df.columns]
 
-# -----------------------------
-# STREAMLIT UI
-# -----------------------------
+    # ---- Strike Price ----
+    strike_col = None
+    for col in df.columns:
+        if "strike" in col.lower():
+            strike_col = col
+            break
 
-st.title("🪐 वेदिक ग्रह घड़ी — Circular Chakra (HTML Version)")
+    if strike_col is None:
+        st.warning(f"{symbol}: Could not find 'Strike' column.")
+        return None
 
-col1, col2, col3 = st.columns(3)
+    # Extract numeric strike
+    strike_series = (
+        df[strike_col]
+        .astype(str)
+        .str.replace(",", "", regex=False)
+        .str.extract(r"(\d+\.?\d*)")[0]
+    )
+    df["Strike Price"] = pd.to_numeric(strike_series, errors="coerce")
 
-date = col1.date_input("तारीख़ चुनें")
-time = col2.time_input("समय चुनें")
+    # ---- OI Change % columns (CE, PE) ----
+    oi_cols = [c for c in df.columns if "oi" in c.lower() and "%" in c.lower()]
+    if len(oi_cols) >= 2:
+        ce_oi_col, pe_oi_col = oi_cols[0], oi_cols[1]
+    else:
+        # fallback to earlier known names
+        ce_oi_col = "OI (Chg %)"
+        pe_oi_col = "OI (Chg %).1"
+        if ce_oi_col not in df.columns or pe_oi_col not in df.columns:
+            st.warning(f"{symbol}: Could not locate CE/PE OI (Chg %) columns.")
+            return None
 
-if col3.button("अब"):
-    now = datetime.datetime.now(pytz.timezone("Asia/Kolkata"))
-    date, time = now.date(), now.time()
+    df["CE_OI_Change_%"] = (
+        df[ce_oi_col]
+        .astype(str)
+        .str.extract(r"\((.*?)\)")[0]
+        .str.replace("%", "", regex=False)
+        .str.strip()
+    )
+    df["PE_OI_Change_%"] = (
+        df[pe_oi_col]
+        .astype(str)
+        .str.extract(r"\((.*?)\)")[0]
+        .str.replace("%", "", regex=False)
+        .str.strip()
+    )
 
-dt = datetime.datetime.combine(date, time)
-pos = get_positions(dt)
+    df["CE_OI_Change_%"] = pd.to_numeric(df["CE_OI_Change_%"], errors="coerce")
+    df["PE_OI_Change_%"] = pd.to_numeric(df["PE_OI_Change_%"], errors="coerce")
 
-# Chakra Display
-svg = generate_svg(pos)
-st.components.v1.html(svg, height=720)
+    df = df.dropna(subset=["Strike Price"])
 
-# Table
-st.subheader("ग्रह तालिका")
+    return df
 
-table = []
-for p, code, sym in PLANETS:
-    table.append([
-        p, sym,
-        f"{pos[p]:.2f}°",
-        SIGNS[int(pos[p]//30)],
-        nakshatra_of(pos[p])
-    ])
+# ======================================================
+# ITM 1–2 STRIKES SELECTION (BASED ON CLOSE PRICE)
+# ======================================================
 
-st.table(table)
+def get_itm_strikes(df: pd.DataFrame, close_price: float):
+    """
+    From full OC table, return:
+      - 2 ITM CALL strikes (nearest below close)
+      - 2 ITM PUT strikes (nearest above close)
+    Also returns ATM strike for reference.
+    """
+    d = df.copy()
+    d = d.sort_values("Strike Price").reset_index(drop=True)
 
-st.success("समय (IST): " + dt.strftime("%d-%b-%Y %H:%M:%S"))
+    strikes = d["Strike Price"].values
+    if len(strikes) == 0:
+        return pd.DataFrame(), pd.DataFrame(), None
+
+    # ATM (closest to close)
+    atm_idx = int(np.argmin(np.abs(strikes - close_price)))
+    atm_strike = strikes[atm_idx]
+
+    # ITM CALL = strikes BELOW close (2 closest)
+    call_mask = strikes < close_price
+    call_strikes = strikes[call_mask]
+    if len(call_strikes) > 0:
+        # Take last 2
+        call_itm_strikes = call_strikes[-2:]
+        itm_call_df = d[d["Strike Price"].isin(call_itm_strikes)]
+    else:
+        itm_call_df = d.iloc[0:0]  # empty
+
+    # ITM PUT = strikes ABOVE close (2 closest)
+    put_mask = strikes > close_price
+    put_strikes = strikes[put_mask]
+    if len(put_strikes) > 0:
+        put_itm_strikes = put_strikes[:2]
+        itm_put_df = d[d["Strike Price"].isin(put_itm_strikes)]
+    else:
+        itm_put_df = d.iloc[0:0]
+
+    return itm_call_df, itm_put_df, atm_strike
+
+# ======================================================
+# SYMBOL LIST (YOUR ORIGINAL LIST)
+# ======================================================
+
+ALL_SYMBOLS = [
+    'BANKNIFTY','CNXFINANCE','CNXMIDCAP','NIFTY','NIFTYJR',
+    '360ONE','ABB','ABCAPITAL','ADANIENSOL','ADANIENT','ADANIGREEN',
+    'ADANIPORTS','ALKEM','AMBER','AMBUJACEM','ANGELONE','APLAPOLLO',
+    'APOLLOHOSP','ASHOKLEY','ASIANPAINT','ASTRAL','AUBANK','AUROPHARMA',
+    'AXISBANK','BAJAJ_AUTO','BAJAJFINSV','BAJFINANCE','BANDHANBNK',
+    'BANKBARODA','BANKINDIA','BDL','BEL','BHARATFORG','BHARTIARTL',
+    'BHEL','BIOCON','BLUESTARCO','BOSCHLTD','BPCL','BRITANNIA','BSE',
+    'CAMS','CANBK','CDSL','CGPOWER','CHOLAFIN','CIPLA','COALINDIA',
+    'COFORGE','COLPAL','CONCOR','CROMPTON','CUMMINSIND','CYIENT','DABUR',
+    'DALBHARAT','DELHIVERY','DIVISLAB','DIXON','DLF','DMART','DRREDDY',
+    'EICHERMOT','ETERNAL','EXIDEIND','FEDERALBNK','FORTIS','GAIL',
+    'GLENMARK','GMRAIRPORT','GODREJCP','GODREJPROP','GRASIM','HAL',
+    'HAVELLS','HCLTECH','HDFCAMC','HDFCBANK','HDFCLIFE','HEROMOTOCO',
+    'HFCL','HINDALCO','HINDPETRO','HINDUNILVR','HINDZINC','HUDCO',
+    'ICICIBANK','ICICIGI','ICICIPRULI','IDEA','IDFCFIRSTB','IEX','IGL',
+    'IIFL','INDHOTEL','INDIANB','INDIGO','INDUSINDBK','INDUSTOWER',
+    'INFY','INOXWIND','IOC','IRCTC','IREDA','IRFC','ITC','JINDALSTEL',
+    'JIOFIN','JSWENERGY','JSWSTEEL','JUBLFOOD','KALYANKJIL','KAYNES',
+    'KEI','KFINTECH','KOTAKBANK','KPITTECH','LAURUSLABS','LICHSGFIN',
+    'LICI','LODHA','LT','LTF','LTIM','LUPIN','M&M','MANAPPURAM',
+    'MANKIND','MARICO','MARUTI','MAXHEALTH','MAZDOCK','MCX','MFSL',
+    'MOTHERSON','MPHASIS','MUTHOOTFIN','NATIONALUM','NAUKRI','NBCC',
+    'NCC','NESTLEIND','NHPC','NMDC','NTPC','NUVAMA','NYKAA',
+    'OBEROIRLTY','OFSS','OIL','ONGC','PAGEIND','PATANJALI','PAYTM',
+    'PERSISTENT','PETRONET','PFC','PGEL','PHOENIXLTD','PIDILITIND',
+    'PIIND','PNB','PNBHOUSING','POLICYBZR','POLYCAB','POWERGRID',
+    'PPLPHARMA','PRESTIGE','RBLBANK','RECLTD','RELIANCE','RVNL','SAIL',
+    'SAMMAANCAP','SBICARD','SBILIFE','SBIN','SHREECEM','SHRIRAMFIN',
+    'SIEMENS','SOLARINDS','SONACOMS','SRF','SUNPHARMA','SUPREMEIND',
+    'SUZLON','SYNGENE','TATACHEM','TATACONSUM','TATAELXSI','TATAMOTORS',
+    'TATAPOWER','TATASTEEL','TATATECH','TCS','TECHM','TIINDIA',
+    'TITAGARH','TITAN','TORNTPHARM','TORNTPOWER','TRENT','TVSMOTOR',
+    'ULTRACEMCO','UNIONBANK','UNITDSPR','UNOMINDA','UPL','VBL','VEDL',
+    'VOLTAS','WIPRO','YESBANK','ZYDUSLIFE'
+]
+
+# ======================================================
+# UI CONTROLS
+# ======================================================
+
+col_sel, col_thr = st.columns([2, 1])
+
+with col_sel:
+    selected_symbols = st.multiselect(
+        "Select Symbols to Scan",
+        options=sorted(ALL_SYMBOLS),
+        default=["NIFTY", "BANKNIFTY", "RELIANCE"]
+    )
+
+with col_thr:
+    decay_threshold = st.number_input(
+        "Decay % Threshold (<= this value)",
+        min_value=-100.0,
+        max_value=0.0,
+        value=-30.0,
+        step=1.0
+    )
+
+run_button = st.button("🚀 Run Scan")
+
+# ======================================================
+# MAIN SCAN
+# ======================================================
+
+all_rows = []  # for Excel export
+
+if run_button:
+    if not selected_symbols:
+        st.warning("Please select at least one symbol.")
+    else:
+        for sym in selected_symbols:
+            with st.spinner(f"Scanning {sym}..."):
+                close_price = get_close_price(sym)
+                if close_price is None:
+                    st.error(f"{sym}: Could not fetch close price from NSE.")
+                    continue
+
+                oc_df = fetch_option_chain_niftytrader(sym)
+                if oc_df is None or oc_df.empty:
+                    st.error(f"{sym}: Could not fetch/parse option chain.")
+                    continue
+
+                itm_calls_df, itm_puts_df, atm_strike = get_itm_strikes(oc_df, close_price)
+
+                st.subheader(f"📌 {sym}")
+                st.write(
+                    f"**Close Price (NSE)**: `{close_price}` &nbsp;&nbsp; "
+                    f"**ATM Strike (approx)**: `{atm_strike}`"
+                )
+
+                # Apply decay filter
+                calls_filtered = itm_calls_df[
+                    (itm_calls_df["CE_OI_Change_%"].notna()) &
+                    (itm_calls_df["CE_OI_Change_%"] <= decay_threshold)
+                ].copy()
+                puts_filtered = itm_puts_df[
+                    (itm_puts_df["PE_OI_Change_%"].notna()) &
+                    (itm_puts_df["PE_OI_Change_%"] <= decay_threshold)
+                ].copy()
+
+                calls_filtered["Symbol"] = sym
+                calls_filtered["Side"] = "CALL_ITM"
+                puts_filtered["Symbol"] = sym
+                puts_filtered["Side"] = "PUT_ITM"
+
+                # Keep only key columns + original for inspection
+                display_cols = [
+                    "Symbol", "Side", "Strike Price",
+                    "CE_OI_Change_%", "PE_OI_Change_%"
+                ]
+                extra_cols = [c for c in oc_df.columns if c not in display_cols]
+                display_cols_full = display_cols + extra_cols
+
+                st.markdown("**📉 ITM CALL (1–2 strikes) with OI Decay filter**")
+                if calls_filtered.empty:
+                    st.info("No ITM CALL strikes meeting decay condition.")
+                else:
+                    st.dataframe(calls_filtered[display_cols_full])
+                    all_rows.append(calls_filtered)
+
+                st.markdown("**📉 ITM PUT (1–2 strikes) with OI Decay filter**")
+                if puts_filtered.empty:
+                    st.info("No ITM PUT strikes meeting decay condition.")
+                else:
+                    st.dataframe(puts_filtered[display_cols_full])
+                    all_rows.append(puts_filtered)
+
+        # ==============================
+        # EXCEL DOWNLOAD
+        # ==============================
+        if all_rows:
+            final_df = pd.concat(all_rows, ignore_index=True)
+
+            buffer = BytesIO()
+            final_df.to_excel(buffer, index=False)
+            buffer.seek(0)
+
+            st.success(f"Scan completed. {len(final_df)} rows matched.")
+            st.download_button(
+                label="📥 Download Filtered ITM OI Decay Data (Excel)",
+                data=buffer,
+                file_name="oi_decay_itm_filtered.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+            )
+        else:
+            st.warning("No strikes met the decay condition across selected symbols.")
