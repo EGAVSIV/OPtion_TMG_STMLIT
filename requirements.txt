@@ -6,3 +6,4 @@ lxml
 bs4
 openpyxl
 tradingview-datafeed
+altair
