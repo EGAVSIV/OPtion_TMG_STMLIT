@@ -1,51 +1,29 @@
-import streamlit as st
+# app.py
+import time
+from io import BytesIO
+import requests
 import pandas as pd
 import numpy as np
-import requests
-from io import BytesIO
+import streamlit as st
 from tvDatafeed import TvDatafeed, Interval
 import altair as alt
 
 # ======================================================
-# STREAMLIT CONFIG
+# CONFIG
 # ======================================================
-st.set_page_config(page_title="OI + Greeks OTM Scanner", layout="wide")
-st.title("📉 OTM %OI Decay + Full Option Chain (Greeks, Heatmap, Charts)")
-st.caption("Close Price: TradingView (tvDatafeed) | Option Chain & Greeks: NSE JSON API")
+st.set_page_config(page_title="OI + Greeks OTM Scanner (Optimized)", layout="wide")
+st.title("📉 OTM %OI Decay + Full Option Chain (Greeks, Heatmap, Charts) — Optimized")
+
+# ========== OPTIONAL: Proxy (uncomment & fill if needed) ==========
+# PROXIES = {
+#     "http": "http://USER:PASS@IN_PROXY_IP:PORT",
+#     "https": "http://USER:PASS@IN_PROXY_IP:PORT",
+# }
+PROXIES = None  # keep None if not using proxy
 
 # ======================================================
-# TVDATAFEED (NO LOGIN)
+# NSE SESSION + HEADERS (Stable)
 # ======================================================
-try:
-    tv = TvDatafeed()
-except Exception as e:
-    st.error(f"tvDatafeed initialization failed: {e}")
-    st.stop()
-
-
-def get_close_price(symbol: str):
-    """Close price ONLY from TV datafeed."""
-    try:
-        df = tv.get_hist(symbol=symbol, exchange="NSE", interval=Interval.in_daily, n_bars=2)
-        if df is not None and not df.empty:
-            return float(df["close"].iloc[-1])
-    except Exception:
-        return None
-    return None
-
-
-# ======================================================
-# NSE OPTION CHAIN JSON
-# ======================================================
-# ==== NSE SESSION FIX ====
-# ======================================================
-# NSE OPTION CHAIN (STABLE VERSION)
-# ======================================================
-
-import requests
-import streamlit as st
-
-# ---------- HEADERS (Verified Working Feb 2025) ----------
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
                   "(KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
@@ -62,89 +40,114 @@ HEADERS = {
 }
 
 SESSION = requests.Session()
+if PROXIES:
+    SESSION.proxies.update(PROXIES)
 
 
-# ---------- ALWAYS CALL THIS ONLY ONCE AT START ----------
 def initialize_nse_session():
-    """Fetch homepage ONLY once to load cookies."""
+    """Call once at start to set cookies. Keep minimal and safe."""
     try:
         SESSION.get("https://www.nseindia.com", headers=HEADERS, timeout=10)
     except Exception:
+        # swallow; we'll retry later if necessary
         pass
 
 
-# ---------- CACHED WRAPPER: Prevents repeated NSE hits ----------
+# call once
+initialize_nse_session()
+
+# ======================================================
+# tvDatafeed (close price)
+# ======================================================
+try:
+    tv = TvDatafeed()
+except Exception as e:
+    tv = None
+    st.warning(f"tvDatafeed init failed: {e} — close prices may not be available.")
+
+@st.cache_data(ttl=60)
+def cached_close_price(symbol: str):
+    """Get latest close price via tvDatafeed; cached to avoid repeated calls."""
+    if tv is None:
+        return None
+    try:
+        df = tv.get_hist(symbol=symbol, exchange="NSE", interval=Interval.in_daily, n_bars=2)
+        if df is None or df.empty:
+            return None
+        return float(df["close"].iloc[-1])
+    except Exception:
+        return None
+
+
+# ======================================================
+# NSE OPTION CHAIN FETCH (cached + robust)
+# ======================================================
+INDEX_SYMBOLS = {
+    "NIFTY", "BANKNIFTY", "FINNIFTY", "MIDCPNIFTY",
+    "NIFTYJR", "CNXFINANCE", "CNXMIDCAP"
+}
+
+# small wrapper to allow cached function to call internal fetch
 @st.cache_data(ttl=90)
 def cached_oc(symbol: str):
     return _fetch_raw_oc(symbol)
 
-
-# ---------- REAL NSE FETCH FUNCTION ----------
 def _fetch_raw_oc(symbol: str):
     """
-    Handles:
-    - Equity + Index
-    - 403 blocks
-    - HTML fallback
-    - Cookie refresh retry
+    Robust fetch:
+    - Uses SESSION and HEADERS
+    - Detects HTML fallback and retries after cookie refresh
+    - Returns parsed JSON or None
     """
-
     symbol = symbol.upper().strip()
 
-    # Select NSE endpoint
-    if symbol in {
-        "NIFTY", "BANKNIFTY", "FINNIFTY", "MIDCPNIFTY",
-        "NIFTYJR", "CNXFINANCE", "CNXMIDCAP"
-    }:
+    if symbol in INDEX_SYMBOLS:
         url = f"https://www.nseindia.com/api/option-chain-indices?symbol={symbol}"
     else:
         url = f"https://www.nseindia.com/api/option-chain-equities?symbol={symbol}"
 
-    # ---- FIRST REQUEST ----
     try:
         r = SESSION.get(url, headers=HEADERS, timeout=12)
     except Exception:
-        return None
-
-    # If NSE returned HTML instead of JSON → retry once
-    if "<html" in r.text.lower():
-        # refresh cookies
+        # final fallback: try refreshing cookies once and retry
         try:
-            SESSION.get("https://www.nseindia.com", headers=HEADERS, timeout=10)
-        except:
-            pass
-
-        # retry
-        try:
+            SESSION.get("https://www.nseindia.com", headers=HEADERS, timeout=8)
             r = SESSION.get(url, headers=HEADERS, timeout=12)
-        except:
+        except Exception:
             return None
 
-        if "<html" in r.text.lower():
+    # If HTML returned -> refresh cookies then retry exactly once
+    if r is None or "<html" in r.text.lower():
+        try:
+            SESSION.get("https://www.nseindia.com", headers=HEADERS, timeout=8)
+            r = SESSION.get(url, headers=HEADERS, timeout=12)
+        except Exception:
+            return None
+
+        if r is None or "<html" in r.text.lower():
             return None
 
     # Parse JSON safely
     try:
         data = r.json()
+        if not isinstance(data, dict):
+            return None
+        # basic sanity check
         if "records" not in data:
             return None
-        if "data" not in data["records"]:
-            return None
+        # records.data should exist (may be empty but present)
         return data
     except Exception:
         return None
 
 
-# ---------- PUBLIC FUNCTION CALLED BY MAIN APP ----------
 def fetch_oc_json(symbol: str):
-    """
-    Use cached version to avoid repeated calls & NSE blocks.
-    """
+    """Public helper which uses cached internal fetch."""
     return cached_oc(symbol)
 
 
-# ---------- EXPIRY LIST ----------
 def get_expiry_list(symbol: str):
+    """Return expiryDates list or empty list."""
     data = fetch_oc_json(symbol)
     if not data:
         return []
@@ -152,13 +155,10 @@ def get_expiry_list(symbol: str):
     return rec.get("expiryDates", [])
 
 
-
+# ======================================================
+# CHAIN BUILDERS (unchanged logic, optimized)
+# ======================================================
 def build_compact_chain_table(oc_json, expiry: str | None):
-    """
-    Build compact table for scan:
-      Strike Price, CE_OI_Change_%, CE_OI, PE_OI_Change_%, PE_OI
-    Filtered by selected expiry if provided.
-    """
     if not oc_json:
         return None
 
@@ -166,7 +166,7 @@ def build_compact_chain_table(oc_json, expiry: str | None):
     if expiry:
         data_list = [d for d in all_data if d.get("expiryDate") == expiry]
         if not data_list:
-            data_list = all_data  # fallback if expiry not present
+            data_list = all_data
     else:
         data_list = all_data
 
@@ -176,8 +176,8 @@ def build_compact_chain_table(oc_json, expiry: str | None):
         if strike is None:
             continue
 
-        ce = d.get("CE", {})
-        pe = d.get("PE", {})
+        ce = d.get("CE", {}) or {}
+        pe = d.get("PE", {}) or {}
 
         row = {
             "Strike Price": float(strike),
@@ -201,10 +201,6 @@ def build_compact_chain_table(oc_json, expiry: str | None):
 
 
 def build_full_chain_table(oc_json, expiry: str | None):
-    """
-    Full chain with Greeks, OI, prices for CE & PE.
-    Used for Greeks view, charts, heatmap.
-    """
     if not oc_json:
         return None
 
@@ -257,14 +253,9 @@ def build_full_chain_table(oc_json, expiry: str | None):
 
 
 # ======================================================
-# OTM STRIKE SELECTION (BASED ON CLOSE PRICE)
+# OTM STRIKE SELECTION
 # ======================================================
 def get_otm_strikes(df: pd.DataFrame, close_price: float):
-    """
-    OTM definition:
-      - CALL OTM: first 2 strikes ABOVE close price
-      - PUT OTM : first 2 strikes BELOW close price (nearest)
-    """
     if df is None or df.empty:
         return df.iloc[0:0], df.iloc[0:0], None
 
@@ -282,10 +273,9 @@ def get_otm_strikes(df: pd.DataFrame, close_price: float):
 
 
 # ======================================================
-# STYLING & PLOTS
+# PLOTTING & STYLING
 # ======================================================
 def style_greeks(df: pd.DataFrame, iv_spike: float, iv_crush: float):
-    """Highlight CE_IV / PE_IV cells for spike/crush."""
     def highlight(row):
         styles = []
         for col in df.columns:
@@ -294,16 +284,18 @@ def style_greeks(df: pd.DataFrame, iv_spike: float, iv_crush: float):
                 val = row[col]
                 if pd.notna(val):
                     if val >= iv_spike:
-                        style = "background-color: rgba(0,255,0,0.3);"  # spike (green)
+                        style = "background-color: rgba(0,255,0,0.25);"
                     elif val <= iv_crush:
-                        style = "background-color: rgba(255,0,0,0.3);"  # crush (red)
+                        style = "background-color: rgba(255,0,0,0.25);"
             styles.append(style)
         return styles
-    return df.style.apply(highlight, axis=1)
+    try:
+        return df.style.apply(highlight, axis=1)
+    except Exception:
+        return df
 
 
 def plot_oi_bars(df: pd.DataFrame, title: str):
-    """OI bar chart for CE & PE vs Strike."""
     base = df[["Strike", "CE_OI", "PE_OI"]].copy()
     base = base.melt(id_vars="Strike", value_vars=["CE_OI", "PE_OI"],
                      var_name="Side", value_name="OI")
@@ -322,11 +314,9 @@ def plot_oi_bars(df: pd.DataFrame, title: str):
 
 
 def plot_ltp_chart(df: pd.DataFrame, title: str):
-    """Combined CE/PE LTP vs Strike line chart."""
     base = df[["Strike", "CE_LTP", "PE_LTP"]].copy()
     base = base.melt(id_vars="Strike", value_vars=["CE_LTP", "PE_LTP"],
                      var_name="Side", value_name="LTP")
-
     chart = (
         alt.Chart(base)
         .mark_line(point=True)
@@ -342,14 +332,12 @@ def plot_ltp_chart(df: pd.DataFrame, title: str):
 
 
 def plot_greek_heatmap(df: pd.DataFrame, title: str):
-    """Heatmap of Greeks vs Strike."""
     greek_cols = ["CE_Delta", "CE_Gamma", "CE_Vega", "CE_Theta",
                   "PE_Delta", "PE_Gamma", "PE_Vega", "PE_Theta"]
-    heat_df = df[["Strike"] + greek_cols].melt(
-        id_vars="Strike", value_vars=greek_cols,
+    heat_df = df[["Strike"] + [c for c in greek_cols if c in df.columns]].melt(
+        id_vars="Strike", value_vars=[c for c in greek_cols if c in df.columns],
         var_name="Greek", value_name="Value"
     )
-
     chart = (
         alt.Chart(heat_df.dropna(subset=["Value"]))
         .mark_rect()
@@ -365,7 +353,7 @@ def plot_greek_heatmap(df: pd.DataFrame, title: str):
 
 
 # ======================================================
-# SYMBOL LIST
+# SYMBOL LIST (same as before)
 # ======================================================
 ALL_SYMBOLS = [
     "BANKNIFTY", "CNXFINANCE", "CNXMIDCAP", "NIFTY", "NIFTYJR", "360ONE", "ABB",
@@ -395,10 +383,9 @@ ALL_SYMBOLS = [
 ]
 
 # ======================================================
-# UI AREA
+# UI
 # ======================================================
 st.markdown("### Selection & Filters")
-
 col_sel, col_opts = st.columns([3, 2])
 
 with col_sel:
@@ -418,9 +405,10 @@ with col_opts:
     iv_spike = st.number_input("IV Spike ≥", min_value=0.0, max_value=300.0, value=50.0)
     iv_crush = st.number_input("IV Crush ≤", min_value=0.0, max_value=300.0, value=10.0)
     show_greeks_all = st.checkbox("Show Greeks Table & Charts for all symbols")
+    per_symbol_delay = st.number_input("Delay between symbol calls (s)", min_value=0.0, max_value=5.0, value=1.0, step=0.1)
 
 
-# Expiry selection (based on first selected symbol)
+# expiry selection based on first selected symbol
 selected_expiry = None
 if selected_symbols:
     base_symbol = selected_symbols[0]
@@ -444,11 +432,8 @@ if run_scan:
     if not selected_symbols:
         st.warning("Please select at least one symbol.")
     elif len(selected_symbols) == 1:
-        # ============================
-        # SINGLE SYMBOL MODE
-        # ============================
         sym = selected_symbols[0]
-        close_price = get_close_price(sym)
+        close_price = cached_close_price(sym)
         if close_price is None:
             st.error(f"{sym}: Close price not available from TV.")
         else:
@@ -478,7 +463,7 @@ if run_scan:
                     st.markdown("### 🔥 Greeks Heatmap")
                     plot_greek_heatmap(full_chain, f"{sym} — Greeks Heatmap")
 
-                # OTM decay scan for same symbol
+                # OTM decay scan
                 compact_df = build_compact_chain_table(oc_json, selected_expiry)
                 if compact_df is not None and not compact_df.empty:
                     call_otm, put_otm, atm = get_otm_strikes(compact_df, close_price)
@@ -504,22 +489,27 @@ if run_scan:
                     else:
                         st.info("No OTM strikes meeting decay threshold for this symbol.")
     else:
-        # ============================
-        # MULTI-SYMBOL MODE
-        # ============================
+        # MULTI SYMBOL MODE
         all_results = []
+        # Do not refresh cookies inside loop; we already initialized once.
+        for idx, sym in enumerate(selected_symbols, start=1):
+            # polite delay to avoid burst
+            if per_symbol_delay:
+                time.sleep(per_symbol_delay)
 
-        for sym in selected_symbols:
-            close_price = get_close_price(sym)
+            close_price = cached_close_price(sym)
             if close_price is None:
+                st.write(f"Skipping {sym}: close price not available.")
                 continue
 
             oc_json = fetch_oc_json(sym)
             if not oc_json:
+                st.write(f"Skipping {sym}: option chain not available.")
                 continue
 
             compact_df = build_compact_chain_table(oc_json, selected_expiry)
             if compact_df is None or compact_df.empty:
+                st.write(f"Skipping {sym}: no compact chain data.")
                 continue
 
             call_otm, put_otm, atm = get_otm_strikes(compact_df, close_price)
@@ -547,7 +537,6 @@ if run_scan:
                 put_ok["ATM_Approx"] = atm
                 all_results.append(put_ok)
 
-            # Full Greeks/Charts per symbol if toggle ON
             if show_greeks_all:
                 full_chain = build_full_chain_table(oc_json, selected_expiry)
                 if full_chain is not None and not full_chain.empty:
@@ -576,3 +565,5 @@ if run_scan:
             )
         else:
             st.warning("No OTM strikes met the decay condition across symbols.")
+
+# End of script
