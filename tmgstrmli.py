@@ -71,8 +71,10 @@ INDEX_SYMBOLS = {
 
 
 def fetch_oc_json(symbol: str):
-    """Fetch raw NSE option-chain JSON for given symbol."""
     symbol = symbol.upper().strip()
+
+    refresh_nse_cookies()  # <<< THIS FIXES THE 403 ISSUE
+
     if symbol in INDEX_SYMBOLS:
         url = f"https://www.nseindia.com/api/option-chain-indices?symbol={symbol}"
     else:
@@ -80,10 +82,20 @@ def fetch_oc_json(symbol: str):
 
     try:
         r = SESSION.get(url, headers=HEADERS, timeout=15)
-        r.raise_for_status()
-        return r.json()
+        if r.status_code != 200:
+            return None
+
+        data = r.json()
+        if "records" not in data:
+            return None
+
+        return data
+
+    except ValueError:
+        return None
     except Exception:
         return None
+
 
 
 def get_expiry_list(symbol: str):
