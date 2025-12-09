@@ -109,121 +109,93 @@ def get_expiry_list(symbol: str):
         return []
 
 def build_full_chain_table_nt(symbol: str, expiry: str | None):
-    """
-    Build full OC DataFrame (CE+PE) from NiftyTrader structure.
-    If expiry is None, include all expiries returned by the API.
-    """
-    js = fetch_nt_oc(symbol)
+    js = fetch_oc_json(symbol)
     if not js:
         return None
 
-    data = js.get("data", {})
-    chain = data.get("optionChain") or data.get("options") or []
+    all_data = js["records"].get("data", [])
+    if expiry:
+        data_list = [d for d in all_data if d.get("expiryDate") == expiry]
+        if not data_list:  
+            data_list = all_data
+    else:
+        data_list = all_data
+
     rows = []
-
-    for item in chain:
-        item_exp = item.get("expiryDate") or item.get("expiry")
-        if expiry and item_exp != expiry:
+    for item in data_list:
+        strike = item.get("strikePrice")
+        if strike is None:
             continue
 
-        # strike price may be numeric or string
-        try:
-            strike = float(item.get("strikePrice") or item.get("strike") or item.get("strike_price"))
-        except Exception:
-            continue
-
-        ce = item.get("CE") or item.get("call") or {}
-        pe = item.get("PE") or item.get("put") or {}
-
-        # safe getters with multiple possible keys used by different providers
-        def safe_get(o, *keys):
-            for k in keys:
-                if isinstance(o, dict) and k in o:
-                    return o.get(k)
-            return None
-
-        row = {
-            "Strike": strike,
-            # CE
-            "CE_LTP": safe_get(ce, "LTP", "lastPrice", "last_price"),
-            "CE_OI": safe_get(ce, "OI", "openInterest"),
-            "CE_Change_OI": safe_get(ce, "changeOI", "changeinOpenInterest"),
-            "CE_pChange_OI": safe_get(ce, "pchangeOI", "pchangeinOpenInterest"),
-            "CE_IV": safe_get(ce, "IV", "impliedVolatility"),
-            "CE_Delta": safe_get(ce, "delta"),
-            "CE_Vega": safe_get(ce, "vega"),
-            "CE_Gamma": safe_get(ce, "gamma"),
-            "CE_Theta": safe_get(ce, "theta"),
-            # PE
-            "PE_LTP": safe_get(pe, "LTP", "lastPrice", "last_price"),
-            "PE_OI": safe_get(pe, "OI", "openInterest"),
-            "PE_Change_OI": safe_get(pe, "changeOI", "changeinOpenInterest"),
-            "PE_pChange_OI": safe_get(pe, "pchangeOI", "pchangeinOpenInterest"),
-            "PE_IV": safe_get(pe, "IV", "impliedVolatility"),
-            "PE_Delta": safe_get(pe, "delta"),
-            "PE_Vega": safe_get(pe, "vega"),
-            "PE_Gamma": safe_get(pe, "gamma"),
-            "PE_Theta": safe_get(pe, "theta"),
-        }
-        rows.append(row)
-
-    if not rows:
-        return None
-
-    df = pd.DataFrame(rows)
-    # normalize numeric columns where possible
-    numcols = ["Strike", "CE_LTP", "CE_OI", "CE_Change_OI", "CE_pChange_OI", "CE_IV",
-               "CE_Delta", "CE_Vega", "CE_Gamma", "CE_Theta",
-               "PE_LTP", "PE_OI", "PE_Change_OI", "PE_pChange_OI", "PE_IV",
-               "PE_Delta", "PE_Vega", "PE_Gamma", "PE_Theta"]
-    for c in numcols:
-        if c in df.columns:
-            df[c] = pd.to_numeric(df[c], errors="coerce")
-    return df.sort_values("Strike").reset_index(drop=True)
-
-def build_compact_chain_table_nt(symbol: str, expiry: str | None):
-    """
-    Build compact OTM-scan table from NiftyTrader response:
-    Strike Price, CE_OI_Change_%, CE_OI, PE_OI_Change_%, PE_OI
-    """
-    js = fetch_nt_oc(symbol)
-    if not js:
-        return None
-
-    data = js.get("data", {})
-    chain = data.get("optionChain") or data.get("options") or []
-    rows = []
-
-    for item in chain:
-        item_exp = item.get("expiryDate") or item.get("expiry")
-        if expiry and item_exp != expiry:
-            continue
-
-        try:
-            strike = float(item.get("strikePrice") or item.get("strike") or item.get("strike_price"))
-        except Exception:
-            continue
-
-        ce = item.get("CE") or item.get("call") or {}
-        pe = item.get("PE") or item.get("put") or {}
+        ce = item.get("CE", {}) or {}
+        pe = item.get("PE", {}) or {}
 
         rows.append({
-            "Strike Price": strike,
-            "CE_OI_Change_%": ce.get("pchangeOI") or ce.get("pchangeinOpenInterest") or None,
-            "CE_OI": ce.get("OI") or ce.get("openInterest") or None,
-            "PE_OI_Change_%": pe.get("pchangeOI") or pe.get("pchangeinOpenInterest") or None,
-            "PE_OI": pe.get("OI") or pe.get("openInterest") or None,
+            "Strike": float(strike),
+            "CE_LTP": ce.get("lastPrice", None),
+            "CE_OI": ce.get("openInterest", None),
+            "CE_Change_OI": ce.get("changeinOpenInterest", None),
+            "CE_pChange_OI": ce.get("pchangeinOpenInterest", None),
+            "CE_IV": ce.get("impliedVolatility", None),
+            "CE_Delta": ce.get("delta", None),
+            "CE_Vega": ce.get("vega", None),
+            "CE_Gamma": ce.get("gamma", None),
+            "CE_Theta": ce.get("theta", None),
+
+            "PE_LTP": pe.get("lastPrice", None),
+            "PE_OI": pe.get("openInterest", None),
+            "PE_Change_OI": pe.get("changeinOpenInterest", None),
+            "PE_pChange_OI": pe.get("pchangeinOpenInterest", None),
+            "PE_IV": pe.get("impliedVolatility", None),
+            "PE_Delta": pe.get("delta", None),
+            "PE_Vega": pe.get("vega", None),
+            "PE_Gamma": pe.get("gamma", None),
+            "PE_Theta": pe.get("theta", None),
         })
 
     if not rows:
         return None
 
     df = pd.DataFrame(rows)
-    df["CE_OI_Change_%"] = pd.to_numeric(df["CE_OI_Change_%"], errors="coerce")
-    df["PE_OI_Change_%"] = pd.to_numeric(df["PE_OI_Change_%"], errors="coerce")
-    df["Strike Price"] = pd.to_numeric(df["Strike Price"], errors="coerce")
-    df = df.dropna(subset=["Strike Price"])
+    return df.sort_values("Strike").reset_index(drop=True)
+
+
+def build_compact_chain_table_nt(symbol: str, expiry: str | None):
+    js = fetch_oc_json(symbol)
+    if not js:
+        return None
+
+    all_data = js["records"].get("data", [])
+    if expiry:
+        data_list = [d for d in all_data if d.get("expiryDate") == expiry]
+        if not data_list:  
+            data_list = all_data
+    else:
+        data_list = all_data
+
+    rows = []
+    for d in data_list:
+        strike = d.get("strikePrice")
+        if strike is None:
+            continue
+
+        ce = d.get("CE", {}) or {}
+        pe = d.get("PE", {}) or {}
+
+        rows.append({
+            "Strike Price": float(strike),
+            "CE_OI_Change_%": ce.get("pchangeinOpenInterest"),
+            "CE_OI": ce.get("openInterest"),
+            "PE_OI_Change_%": pe.get("pchangeinOpenInterest"),
+            "PE_OI": pe.get("openInterest"),
+        })
+
+    if not rows:
+        return None
+
+    df = pd.DataFrame(rows)
     return df.sort_values("Strike Price").reset_index(drop=True)
+
 
 # ======================================================
 # OTM STRIKE SELECTION (BASED ON CLOSE PRICE)
