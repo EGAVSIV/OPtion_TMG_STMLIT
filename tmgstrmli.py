@@ -37,17 +37,27 @@ def get_close_price(symbol: str):
 # ======================================================
 # NSE OPTION CHAIN JSON
 # ======================================================
+# ==== NSE SESSION FIX ====
 HEADERS = {
-    "User-Agent": "Mozilla/5.0",
-    "Accept": "application/json",
-    "Referer": "https://www.nseindia.com/",
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                  "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    "Accept": "*/*",
+    "Accept-Encoding": "gzip, deflate, br",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Referer": "https://www.nseindia.com/option-chain",
+    "Origin": "https://www.nseindia.com",
+    "Connection": "keep-alive",
 }
 
 SESSION = requests.Session()
-try:
-    SESSION.get("https://www.nseindia.com", headers=HEADERS, timeout=10)
-except Exception:
-    pass
+
+def refresh_nse_cookies():
+    """Fetch homepage to refresh cookies. MUST be done before OC API hits."""
+    try:
+        SESSION.get("https://www.nseindia.com", headers=HEADERS, timeout=10)
+    except Exception:
+        pass
+
 
 INDEX_SYMBOLS = {
     "NIFTY",
