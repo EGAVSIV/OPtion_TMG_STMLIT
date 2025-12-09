@@ -567,3 +567,7 @@ if run_scan:
             st.warning("No OTM strikes met the decay condition across symbols.")
 
 # End of script
+
+test = SESSION.get("https://www.nseindia.com/api/option-chain-equities?symbol=ABCAPITAL", headers=HEADERS)
+st.code(test.text[:500])
+
