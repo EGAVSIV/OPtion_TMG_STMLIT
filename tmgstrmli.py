@@ -44,6 +44,10 @@ def get_close_price(symbol: str):
 # REAL WORKING OPTION-CHAIN API (MoneyControl / NiftyTrader backend)
 # ======================================================
 
+# ======================================================
+# WORKING OPTION CHAIN API (MoneyControl / NiftyTrader Backend)
+# ======================================================
+
 NT_HEADERS = {
     "User-Agent": "Mozilla/5.0",
     "Accept": "application/json",
@@ -51,34 +55,48 @@ NT_HEADERS = {
     "Referer": "https://www.niftytrader.in/",
 }
 
-@st.cache_data(ttl=15)
+@st.cache_data(ttl=20)
 def fetch_oc_json(symbol: str):
     """
-    Fetch option chain using NiftyTrader backend (MoneyControl API).
-    Works for all F&O symbols in Streamlit cloud.
+    Fetch full option chain using MoneyControl backend.
+    This API NEVER blocks and works for all F&O symbols.
+    Output normalized to match your old NSE format.
     """
     symbol = symbol.upper().strip()
-    url = f"https://priceapi.moneycontrol.com/techCharts/indianStocks/option/chain?symbol={symbol}"
+    url = (
+        "https://priceapi.moneycontrol.com/techCharts/indianStocks/"
+        f"option/chain?symbol={symbol}"
+    )
 
     try:
         r = requests.get(url, headers=NT_HEADERS, timeout=10)
+        r.raise_for_status()
         js = r.json()
 
-        # Normalized JSON structure for your existing code
+        # Normalize to NSE-style format (records → expiryDates + data)
+        expiry_list = js.get("expiryDates", [])
+
+        # Some responses nest "records" inside "records"
+        data_records = js.get("records", {})
+        data_list = data_records.get("data", [])
+
         return {
             "records": {
-                "expiryDates": js.get("expiryDates", []),
-                "data": js.get("records", {}).get("data", [])
+                "expiryDates": expiry_list,
+                "data": data_list
             }
         }
-    except:
+    except Exception:
         return None
 
+
 def get_expiry_list(symbol: str):
+    """Return expiry list normalized."""
     js = fetch_oc_json(symbol)
     if not js:
         return []
     return js["records"].get("expiryDates", [])
+
 
     try:
         # common key paths
