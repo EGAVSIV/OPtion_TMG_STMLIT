@@ -5,6 +5,7 @@ import requests
 import pandas as pd
 import numpy as np
 import streamlit as st
+from typing import Optional
 from tvDatafeed import TvDatafeed, Interval
 import altair as alt
 
@@ -13,7 +14,7 @@ import altair as alt
 # ======================================================
 st.set_page_config(page_title="OI + Greeks OTM Scanner", layout="wide")
 st.title("📉 OTM %OI Decay + Full Option Chain (Greeks, Heatmap, Charts)")
-st.caption("Close Price: TradingView (tvDatafeed) | Option Chain & Greeks: NiftyTrader API")
+st.caption("Close Price: TradingView (tvDatafeed) | Option Chain & Greeks: NiftyTrader/MoneyControl API")
 
 # ======================================================
 # tvDatafeed (no-login)
@@ -25,7 +26,7 @@ except Exception as e:
     st.warning(f"tvDatafeed initialization failed: {e} — close prices may not be available.")
 
 @st.cache_data(ttl=60)
-def get_close_price(symbol: str):
+def get_close_price(symbol: str) -> Optional[float]:
     """Close price ONLY from TV datafeed (cached)."""
     if tv is None:
         return None
@@ -38,16 +39,8 @@ def get_close_price(symbol: str):
     return None
 
 # ======================================================
-# NiftyTrader Option Chain Fetch (replaces NSE)
-# ======================================================
-# ======================================================
-# REAL WORKING OPTION-CHAIN API (MoneyControl / NiftyTrader backend)
-# ======================================================
-
-# ======================================================
 # WORKING OPTION CHAIN API (MoneyControl / NiftyTrader Backend)
 # ======================================================
-
 NT_HEADERS = {
     "User-Agent": "Mozilla/5.0",
     "Accept": "application/json",
@@ -58,9 +51,11 @@ NT_HEADERS = {
 @st.cache_data(ttl=20)
 def fetch_oc_json(symbol: str):
     """
-    Fetch full option chain using MoneyControl backend.
-    This API NEVER blocks and works for all F&O symbols.
-    Output normalized to match your old NSE format.
+    Fetch full option chain using MoneyControl backend (used by NiftyTrader).
+    Cached to reduce repeated cloud requests.
+    Returns normalized dict with structure:
+        {"records": {"expiryDates": [...], "data": [...]}}
+    or None on failure.
     """
     symbol = symbol.upper().strip()
     url = (
@@ -68,144 +63,176 @@ def fetch_oc_json(symbol: str):
         f"option/chain?symbol={symbol}"
     )
 
-    try:
-        r = requests.get(url, headers=NT_HEADERS, timeout=10)
-        r.raise_for_status()
-        js = r.json()
+    # simple retry for transient network issues
+    tries = 2
+    for attempt in range(tries):
+        try:
+            r = requests.get(url, headers=NT_HEADERS, timeout=10)
+            r.raise_for_status()
+            js = r.json()
 
-        # Normalize to NSE-style format (records → expiryDates + data)
-        expiry_list = js.get("expiryDates", [])
+            # Some endpoints return expiryDates at root and records.data nested
+            expiry_list = js.get("expiryDates", []) or js.get("records", {}).get("expiryDates", [])
+            data_list = js.get("records", {}).get("data", [])
+            # fallback if structure differs (some responses may embed in 'data' directly)
+            if not data_list and "data" in js:
+                data_list = js.get("data", {}).get("data", []) or js.get("data", [])
 
-        # Some responses nest "records" inside "records"
-        data_records = js.get("records", {})
-        data_list = data_records.get("data", [])
+            # ensure lists
+            expiry_list = expiry_list or []
+            data_list = data_list or []
 
-        return {
-            "records": {
-                "expiryDates": expiry_list,
-                "data": data_list
+            return {
+                "records": {
+                    "expiryDates": expiry_list,
+                    "data": data_list
+                }
             }
-        }
-    except Exception:
-        return None
-
+        except Exception:
+            # backoff between retries
+            if attempt < tries - 1:
+                time.sleep(0.6 * (attempt + 1))
+            else:
+                return None
 
 def get_expiry_list(symbol: str):
-    """Return expiry list normalized."""
+    """Return expiry list normalized (or empty list)."""
     js = fetch_oc_json(symbol)
     if not js:
         return []
     return js["records"].get("expiryDates", [])
 
-
-    try:
-        # common key paths
-        data = js.get("data", {})
-        # expiryList or expiryList may be key
-        exps = data.get("expiryList") or data.get("expiryDates") or []
-        # normalize: ensure list of strings
-        return [str(x) for x in exps] if exps else []
-    except Exception:
-        return []
-
-def build_full_chain_table_nt(symbol: str, expiry: str | None):
+# ======================================================
+# CHAIN BUILDERS (robust)
+# ======================================================
+def build_full_chain_table_nt(symbol: str, expiry: Optional[str]):
+    """
+    Return DataFrame with columns:
+      Strike, CE_LTP, CE_OI, CE_Change_OI, CE_pChange_OI, CE_IV, CE_Delta, CE_Vega, CE_Gamma, CE_Theta,
+      PE_LTP, PE_OI, PE_Change_OI, PE_pChange_OI, PE_IV, PE_Delta, PE_Vega, PE_Gamma, PE_Theta
+    """
     js = fetch_oc_json(symbol)
     if not js:
         return None
 
-    all_data = js["records"].get("data", [])
+    all_data = js["records"].get("data", []) or []
     if expiry:
-        data_list = [d for d in all_data if d.get("expiryDate") == expiry]
-        if not data_list:  
+        data_list = [d for d in all_data if (d.get("expiryDate") == expiry or d.get("expiry") == expiry)]
+        if not data_list:
             data_list = all_data
     else:
         data_list = all_data
 
     rows = []
     for item in data_list:
-        strike = item.get("strikePrice")
+        strike = item.get("strikePrice") or item.get("strike")
         if strike is None:
             continue
+        try:
+            strike_f = float(strike)
+        except Exception:
+            continue
 
-        ce = item.get("CE", {}) or {}
-        pe = item.get("PE", {}) or {}
+        ce = item.get("CE") or item.get("call") or {}
+        pe = item.get("PE") or item.get("put") or {}
+
+        def safe_get(o, *keys):
+            if not isinstance(o, dict):
+                return None
+            for k in keys:
+                if k in o:
+                    return o.get(k)
+            return None
 
         rows.append({
-            "Strike": float(strike),
-            "CE_LTP": ce.get("lastPrice", None),
-            "CE_OI": ce.get("openInterest", None),
-            "CE_Change_OI": ce.get("changeinOpenInterest", None),
-            "CE_pChange_OI": ce.get("pchangeinOpenInterest", None),
-            "CE_IV": ce.get("impliedVolatility", None),
-            "CE_Delta": ce.get("delta", None),
-            "CE_Vega": ce.get("vega", None),
-            "CE_Gamma": ce.get("gamma", None),
-            "CE_Theta": ce.get("theta", None),
-
-            "PE_LTP": pe.get("lastPrice", None),
-            "PE_OI": pe.get("openInterest", None),
-            "PE_Change_OI": pe.get("changeinOpenInterest", None),
-            "PE_pChange_OI": pe.get("pchangeinOpenInterest", None),
-            "PE_IV": pe.get("impliedVolatility", None),
-            "PE_Delta": pe.get("delta", None),
-            "PE_Vega": pe.get("vega", None),
-            "PE_Gamma": pe.get("gamma", None),
-            "PE_Theta": pe.get("theta", None),
+            "Strike": strike_f,
+            "CE_LTP": safe_get(ce, "lastPrice", "LTP", "last_price"),
+            "CE_OI": safe_get(ce, "openInterest", "OI"),
+            "CE_Change_OI": safe_get(ce, "changeinOpenInterest", "changeOI"),
+            "CE_pChange_OI": safe_get(ce, "pchangeinOpenInterest", "pchangeOI"),
+            "CE_IV": safe_get(ce, "impliedVolatility", "IV"),
+            "CE_Delta": safe_get(ce, "delta"),
+            "CE_Vega": safe_get(ce, "vega"),
+            "CE_Gamma": safe_get(ce, "gamma"),
+            "CE_Theta": safe_get(ce, "theta"),
+            "PE_LTP": safe_get(pe, "lastPrice", "LTP", "last_price"),
+            "PE_OI": safe_get(pe, "openInterest", "OI"),
+            "PE_Change_OI": safe_get(pe, "changeinOpenInterest", "changeOI"),
+            "PE_pChange_OI": safe_get(pe, "pchangeinOpenInterest", "pchangeOI"),
+            "PE_IV": safe_get(pe, "impliedVolatility", "IV"),
+            "PE_Delta": safe_get(pe, "delta"),
+            "PE_Vega": safe_get(pe, "vega"),
+            "PE_Gamma": safe_get(pe, "gamma"),
+            "PE_Theta": safe_get(pe, "theta"),
         })
 
     if not rows:
         return None
 
     df = pd.DataFrame(rows)
+    # normalize numeric columns where possible
+    numcols = [c for c in df.columns if c != "Strike"]  # Strike already numeric
+    for c in numcols:
+        df[c] = pd.to_numeric(df[c], errors="coerce")
+    df["Strike"] = pd.to_numeric(df["Strike"], errors="coerce")
     return df.sort_values("Strike").reset_index(drop=True)
 
-
-def build_compact_chain_table_nt(symbol: str, expiry: str | None):
+def build_compact_chain_table_nt(symbol: str, expiry: Optional[str]):
     js = fetch_oc_json(symbol)
     if not js:
         return None
 
-    all_data = js["records"].get("data", [])
+    all_data = js["records"].get("data", []) or []
     if expiry:
-        data_list = [d for d in all_data if d.get("expiryDate") == expiry]
-        if not data_list:  
+        data_list = [d for d in all_data if (d.get("expiryDate") == expiry or d.get("expiry") == expiry)]
+        if not data_list:
             data_list = all_data
     else:
         data_list = all_data
 
     rows = []
     for d in data_list:
-        strike = d.get("strikePrice")
+        strike = d.get("strikePrice") or d.get("strike")
         if strike is None:
             continue
+        try:
+            strike_f = float(strike)
+        except Exception:
+            continue
 
-        ce = d.get("CE", {}) or {}
-        pe = d.get("PE", {}) or {}
+        ce = d.get("CE") or d.get("call") or {}
+        pe = d.get("PE") or d.get("put") or {}
+
+        def sg(o, *keys):
+            if not isinstance(o, dict):
+                return None
+            for k in keys:
+                if k in o:
+                    return o.get(k)
+            return None
 
         rows.append({
-            "Strike Price": float(strike),
-            "CE_OI_Change_%": ce.get("pchangeinOpenInterest"),
-            "CE_OI": ce.get("openInterest"),
-            "PE_OI_Change_%": pe.get("pchangeinOpenInterest"),
-            "PE_OI": pe.get("openInterest"),
+            "Strike Price": strike_f,
+            "CE_OI_Change_%": sg(ce, "pchangeinOpenInterest", "pchangeOI"),
+            "CE_OI": sg(ce, "openInterest", "OI"),
+            "PE_OI_Change_%": sg(pe, "pchangeinOpenInterest", "pchangeOI"),
+            "PE_OI": sg(pe, "openInterest", "OI"),
         })
 
     if not rows:
         return None
 
     df = pd.DataFrame(rows)
+    df["CE_OI_Change_%"] = pd.to_numeric(df["CE_OI_Change_%"], errors="coerce")
+    df["PE_OI_Change_%"] = pd.to_numeric(df["PE_OI_Change_%"], errors="coerce")
+    df["Strike Price"] = pd.to_numeric(df["Strike Price"], errors="coerce")
+    df = df.dropna(subset=["Strike Price"])
     return df.sort_values("Strike Price").reset_index(drop=True)
-
 
 # ======================================================
 # OTM STRIKE SELECTION (BASED ON CLOSE PRICE)
 # ======================================================
 def get_otm_strikes(df: pd.DataFrame, close_price: float):
-    """
-    OTM definition:
-      - CALL OTM: first 2 strikes ABOVE close price
-      - PUT OTM : first 2 strikes BELOW close price (nearest)
-    """
     if df is None or df.empty:
         return df.iloc[0:0], df.iloc[0:0], None
 
@@ -222,7 +249,7 @@ def get_otm_strikes(df: pd.DataFrame, close_price: float):
     return call_otm, put_otm, atm_strike
 
 # ======================================================
-# STYLING & PLOTS (same as before)
+# STYLING & PLOTS
 # ======================================================
 def style_greeks(df: pd.DataFrame, iv_spike: float, iv_crush: float):
     """Highlight CE_IV / PE_IV cells for spike/crush."""
@@ -234,9 +261,9 @@ def style_greeks(df: pd.DataFrame, iv_spike: float, iv_crush: float):
                 val = row[col]
                 if pd.notna(val):
                     if val >= iv_spike:
-                        style = "background-color: rgba(0,255,0,0.3);"  # spike (green)
+                        style = "background-color: rgba(0,255,0,0.25);"  # spike (green)
                     elif val <= iv_crush:
-                        style = "background-color: rgba(255,0,0,0.3);"  # crush (red)
+                        style = "background-color: rgba(255,0,0,0.25);"  # crush (red)
             styles.append(style)
         return styles
     try:
@@ -246,7 +273,13 @@ def style_greeks(df: pd.DataFrame, iv_spike: float, iv_crush: float):
 
 def plot_oi_bars(df: pd.DataFrame, title: str):
     """OI bar chart for CE & PE vs Strike."""
+    if df is None or df.empty:
+        st.info("No OI data to plot.")
+        return
     base = df[["Strike", "CE_OI", "PE_OI"]].copy()
+    # fill missing with 0 for plotting
+    base["CE_OI"] = pd.to_numeric(base["CE_OI"], errors="coerce").fillna(0)
+    base["PE_OI"] = pd.to_numeric(base["PE_OI"], errors="coerce").fillna(0)
     base = base.melt(id_vars="Strike", value_vars=["CE_OI", "PE_OI"],
                      var_name="Side", value_name="OI")
     chart = (
@@ -264,12 +297,16 @@ def plot_oi_bars(df: pd.DataFrame, title: str):
 
 def plot_ltp_chart(df: pd.DataFrame, title: str):
     """Combined CE/PE LTP vs Strike line chart."""
+    if df is None or df.empty:
+        st.info("No LTP data to plot.")
+        return
     base = df[["Strike", "CE_LTP", "PE_LTP"]].copy()
+    base["CE_LTP"] = pd.to_numeric(base["CE_LTP"], errors="coerce")
+    base["PE_LTP"] = pd.to_numeric(base["PE_LTP"], errors="coerce")
     base = base.melt(id_vars="Strike", value_vars=["CE_LTP", "PE_LTP"],
                      var_name="Side", value_name="LTP")
-
     chart = (
-        alt.Chart(base)
+        alt.Chart(base.dropna(subset=["LTP"]))
         .mark_line(point=True)
         .encode(
             x=alt.X("Strike:O", sort=None),
@@ -283,9 +320,11 @@ def plot_ltp_chart(df: pd.DataFrame, title: str):
 
 def plot_greek_heatmap(df: pd.DataFrame, title: str):
     """Heatmap of Greeks vs Strike."""
+    if df is None or df.empty:
+        st.info("No Greeks data to plot.")
+        return
     greek_cols = ["CE_Delta", "CE_Gamma", "CE_Vega", "CE_Theta",
                   "PE_Delta", "PE_Gamma", "PE_Vega", "PE_Theta"]
-    # guard for missing columns
     available = [c for c in greek_cols if c in df.columns]
     if not available:
         st.info("No Greek values found for heatmap.")
@@ -310,7 +349,7 @@ def plot_greek_heatmap(df: pd.DataFrame, title: str):
     st.altair_chart(chart, use_container_width=True)
 
 # ======================================================
-# SYMBOL LIST (unchanged; exact names you provided)
+# SYMBOL LIST (unchanged)
 # ======================================================
 ALL_SYMBOLS = [
     "BANKNIFTY", "CNXFINANCE", "CNXMIDCAP", "NIFTY", "NIFTYJR", "360ONE", "ABB",
@@ -340,7 +379,7 @@ ALL_SYMBOLS = [
 ]
 
 # ======================================================
-# UI AREA (keeps same layout as your original)
+# UI AREA
 # ======================================================
 st.markdown("### Selection & Filters")
 
@@ -365,7 +404,7 @@ with col_opts:
     show_greeks_all = st.checkbox("Show Greeks Table & Charts for all symbols")
     per_symbol_delay = st.number_input("Delay between symbol calls (s)", min_value=0.0, max_value=5.0, value=0.2, step=0.05)
 
-# Expiry selection (based on first selected symbol)
+# expiry selection (based on first selected symbol)
 selected_expiry = None
 if selected_symbols:
     base_symbol = selected_symbols[0]
@@ -383,7 +422,7 @@ if selected_symbols:
 run_scan = st.button("🚀 Run Scan")
 
 # ======================================================
-# MAIN LOGIC (preserves your original behavior)
+# MAIN LOGIC
 # ======================================================
 if run_scan:
     if not selected_symbols:
@@ -399,17 +438,17 @@ if run_scan:
 
             full_chain = build_full_chain_table_nt(sym, selected_expiry)
             if full_chain is None:
-                st.error(f"{sym}: Option chain not available from NiftyTrader.")
+                st.error(f"{sym}: Option chain not available from NiftyTrader/MoneyControl.")
             else:
-                # Full chain with Greeks
                 if full_chain is None or full_chain.empty:
                     st.error("No option-chain rows for selected expiry.")
                 else:
                     st.markdown("### 🧮 Full Option Chain with Greeks")
-                    st.dataframe(
-                        style_greeks(full_chain, iv_spike, iv_crush),
-                        use_container_width=True,
-                    )
+                    styled = style_greeks(full_chain, iv_spike, iv_crush)
+                    try:
+                        st.dataframe(styled, use_container_width=True)
+                    except Exception:
+                        st.dataframe(full_chain.fillna(""), use_container_width=True)
 
                     st.markdown("### 📊 Open Interest (CE vs PE)")
                     plot_oi_bars(full_chain, f"{sym} — OI by Strike")
@@ -448,6 +487,7 @@ if run_scan:
     else:
         # MULTI-SYMBOL MODE
         all_results = []
+        skipped = []
 
         for sym in selected_symbols:
             # polite delay to avoid burst
@@ -456,11 +496,13 @@ if run_scan:
 
             close_price = get_close_price(sym)
             if close_price is None:
+                skipped.append((sym, "close price unavailable"))
                 st.write(f"Skipping {sym}: close price not available.")
                 continue
 
             compact_df = build_compact_chain_table_nt(sym, selected_expiry)
             if compact_df is None or compact_df.empty:
+                skipped.append((sym, "no option chain"))
                 st.write(f"Skipping {sym}: option chain not available.")
                 continue
 
@@ -494,13 +536,19 @@ if run_scan:
                 full_chain = build_full_chain_table_nt(sym, selected_expiry)
                 if full_chain is not None and not full_chain.empty:
                     with st.expander(f"📊 Full Chain + Greeks — {sym}"):
-                        st.dataframe(
-                            style_greeks(full_chain, iv_spike, iv_crush),
-                            use_container_width=True,
-                        )
+                        styled = style_greeks(full_chain, iv_spike, iv_crush)
+                        try:
+                            st.dataframe(styled, use_container_width=True)
+                        except Exception:
+                            st.dataframe(full_chain.fillna(""), use_container_width=True)
                         plot_oi_bars(full_chain, f"{sym} — OI by Strike")
                         plot_ltp_chart(full_chain, f"{sym} — LTP by Strike")
                         plot_greek_heatmap(full_chain, f"{sym} — Greeks Heatmap")
+
+        # show skipped summary
+        if skipped:
+            st.info("Some symbols were skipped (symbol, reason):")
+            st.write(pd.DataFrame(skipped, columns=["Symbol", "Reason"]))
 
         if all_results:
             final = pd.concat(all_results, ignore_index=True)
