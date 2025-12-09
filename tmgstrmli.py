@@ -75,35 +75,36 @@ INDEX_SYMBOLS = {
 }
 
 
+PROXIES = {
+    "http":  "http://USERNAME:PASSWORD@IN_PROXY_IP:PORT",
+    "https": "http://USERNAME:PASSWORD@IN_PROXY_IP:PORT",
+}
+
 def fetch_oc_json(symbol: str):
     symbol = symbol.upper().strip()
 
-    # refresh cookies
     try:
-        SESSION.get("https://www.nseindia.com", headers=HEADERS, timeout=10)
+        SESSION.get("https://www.nseindia.com", headers=HEADERS, proxies=PROXIES, timeout=10)
     except:
         pass
 
+    # Endpoint
     if symbol in INDEX_SYMBOLS:
         url = f"https://www.nseindia.com/api/option-chain-indices?symbol={symbol}"
     else:
         url = f"https://www.nseindia.com/api/option-chain-equities?symbol={symbol}"
 
     try:
-        r = SESSION.get(url, headers=HEADERS, timeout=10)
+        r = SESSION.get(url, headers=HEADERS, proxies=PROXIES, timeout=10)
 
-        # If HTML returned => retry once
         if "<html" in r.text.lower():
-            SESSION.get("https://www.nseindia.com", headers=HEADERS, timeout=10)
-            r = SESSION.get(url, headers=HEADERS, timeout=10)
-
-        data = r.json()
-        if "records" not in data or "data" not in data["records"]:
             return None
 
-        return data
+        return r.json()
+
     except:
         return None
+
 
 
 
