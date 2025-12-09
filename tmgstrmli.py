@@ -38,6 +38,14 @@ def get_close_price(symbol: str):
 # NSE OPTION CHAIN JSON
 # ======================================================
 # ==== NSE SESSION FIX ====
+# ======================================================
+# NSE OPTION CHAIN (STABLE VERSION)
+# ======================================================
+
+import requests
+import streamlit as st
+
+# ---------- HEADERS (Verified Working Feb 2025) ----------
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
                   "(KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
@@ -53,70 +61,96 @@ HEADERS = {
     "Sec-Fetch-Dest": "empty",
 }
 
-
 SESSION = requests.Session()
 
-def refresh_nse_cookies():
-    """Fetch homepage to refresh cookies. MUST be done before OC API hits."""
+
+# ---------- ALWAYS CALL THIS ONLY ONCE AT START ----------
+def initialize_nse_session():
+    """Fetch homepage ONLY once to load cookies."""
     try:
         SESSION.get("https://www.nseindia.com", headers=HEADERS, timeout=10)
     except Exception:
         pass
 
 
-INDEX_SYMBOLS = {
-    "NIFTY",
-    "BANKNIFTY",
-    "FINNIFTY",
-    "MIDCPNIFTY",
-    "NIFTYJR",
-    "CNXFINANCE",
-    "CNXMIDCAP",
-}
+# ---------- CACHED WRAPPER: Prevents repeated NSE hits ----------
+@st.cache_data(ttl=90)
+def cached_oc(symbol: str):
+    return _fetch_raw_oc(symbol)
 
 
-PROXIES = {
-    "http":  "http://USERNAME:PASSWORD@IN_PROXY_IP:PORT",
-    "https": "http://USERNAME:PASSWORD@IN_PROXY_IP:PORT",
-}
+# ---------- REAL NSE FETCH FUNCTION ----------
+def _fetch_raw_oc(symbol: str):
+    """
+    Handles:
+    - Equity + Index
+    - 403 blocks
+    - HTML fallback
+    - Cookie refresh retry
+    """
 
-def fetch_oc_json(symbol: str):
     symbol = symbol.upper().strip()
 
-    try:
-        SESSION.get("https://www.nseindia.com", headers=HEADERS, proxies=PROXIES, timeout=10)
-    except:
-        pass
-
-    # Endpoint
-    if symbol in INDEX_SYMBOLS:
+    # Select NSE endpoint
+    if symbol in {
+        "NIFTY", "BANKNIFTY", "FINNIFTY", "MIDCPNIFTY",
+        "NIFTYJR", "CNXFINANCE", "CNXMIDCAP"
+    }:
         url = f"https://www.nseindia.com/api/option-chain-indices?symbol={symbol}"
     else:
         url = f"https://www.nseindia.com/api/option-chain-equities?symbol={symbol}"
 
+    # ---- FIRST REQUEST ----
     try:
-        r = SESSION.get(url, headers=HEADERS, proxies=PROXIES, timeout=10)
+        r = SESSION.get(url, headers=HEADERS, timeout=12)
+    except Exception:
+        return None
+
+    # If NSE returned HTML instead of JSON → retry once
+    if "<html" in r.text.lower():
+        # refresh cookies
+        try:
+            SESSION.get("https://www.nseindia.com", headers=HEADERS, timeout=10)
+        except:
+            pass
+
+        # retry
+        try:
+            r = SESSION.get(url, headers=HEADERS, timeout=12)
+        except:
+            return None
 
         if "<html" in r.text.lower():
             return None
 
-        return r.json()
-
-    except:
+    # Parse JSON safely
+    try:
+        data = r.json()
+        if "records" not in data:
+            return None
+        if "data" not in data["records"]:
+            return None
+        return data
+    except Exception:
         return None
 
 
+# ---------- PUBLIC FUNCTION CALLED BY MAIN APP ----------
+def fetch_oc_json(symbol: str):
+    """
+    Use cached version to avoid repeated calls & NSE blocks.
+    """
+    return cached_oc(symbol)
 
 
-
+# ---------- EXPIRY LIST ----------
 def get_expiry_list(symbol: str):
-    """Get list of expiryDates for the symbol."""
     data = fetch_oc_json(symbol)
     if not data:
         return []
-    records = data.get("records", {})
-    exps = records.get("expiryDates", [])
-    return exps
+    rec = data.get("records", {})
+    return rec.get("expiryDates", [])
+
 
 
 def build_compact_chain_table(oc_json, expiry: str | None):
