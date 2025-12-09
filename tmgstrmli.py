@@ -40,14 +40,19 @@ def get_close_price(symbol: str):
 # ==== NSE SESSION FIX ====
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-                  "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-    "Accept": "*/*",
-    "Accept-Encoding": "gzip, deflate, br",
+                  "(KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
+    "Accept": "application/json, text/plain, */*",
     "Accept-Language": "en-US,en;q=0.9",
     "Referer": "https://www.nseindia.com/option-chain",
     "Origin": "https://www.nseindia.com",
+    "Host": "www.nseindia.com",
     "Connection": "keep-alive",
+    "X-Requested-With": "XMLHttpRequest",
+    "Sec-Fetch-Site": "same-origin",
+    "Sec-Fetch-Mode": "cors",
+    "Sec-Fetch-Dest": "empty",
 }
+
 
 SESSION = requests.Session()
 
@@ -73,7 +78,11 @@ INDEX_SYMBOLS = {
 def fetch_oc_json(symbol: str):
     symbol = symbol.upper().strip()
 
-    refresh_nse_cookies()  # <<< THIS FIXES THE 403 ISSUE
+    # refresh cookies
+    try:
+        SESSION.get("https://www.nseindia.com", headers=HEADERS, timeout=10)
+    except:
+        pass
 
     if symbol in INDEX_SYMBOLS:
         url = f"https://www.nseindia.com/api/option-chain-indices?symbol={symbol}"
@@ -81,20 +90,21 @@ def fetch_oc_json(symbol: str):
         url = f"https://www.nseindia.com/api/option-chain-equities?symbol={symbol}"
 
     try:
-        r = SESSION.get(url, headers=HEADERS, timeout=15)
-        if r.status_code != 200:
-            return None
+        r = SESSION.get(url, headers=HEADERS, timeout=10)
+
+        # If HTML returned => retry once
+        if "<html" in r.text.lower():
+            SESSION.get("https://www.nseindia.com", headers=HEADERS, timeout=10)
+            r = SESSION.get(url, headers=HEADERS, timeout=10)
 
         data = r.json()
-        if "records" not in data:
+        if "records" not in data or "data" not in data["records"]:
             return None
 
         return data
+    except:
+        return None
 
-    except ValueError:
-        return None
-    except Exception:
-        return None
 
 
 
