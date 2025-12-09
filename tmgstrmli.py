@@ -40,40 +40,46 @@ def get_close_price(symbol: str):
 # ======================================================
 # NiftyTrader Option Chain Fetch (replaces NSE)
 # ======================================================
+# ======================================================
+# REAL WORKING OPTION-CHAIN API (MoneyControl / NiftyTrader backend)
+# ======================================================
+
 NT_HEADERS = {
     "User-Agent": "Mozilla/5.0",
     "Accept": "application/json",
+    "Origin": "https://www.niftytrader.in",
     "Referer": "https://www.niftytrader.in/",
 }
 
-# Adjust TTLs as needed — 30s keeps app responsive but reduces calls
-@st.cache_data(ttl=30)
-def fetch_nt_oc(symbol: str):
+@st.cache_data(ttl=15)
+def fetch_oc_json(symbol: str):
     """
-    Fetch Option Chain from NiftyTrader API.
-    Returns parsed JSON dict on success, else None.
+    Fetch option chain using NiftyTrader backend (MoneyControl API).
+    Works for all F&O symbols in Streamlit cloud.
     """
     symbol = symbol.upper().strip()
-    url = f"https://www.niftytrader.in/api/optionchain/live?symbol={symbol}"
+    url = f"https://priceapi.moneycontrol.com/techCharts/indianStocks/option/chain?symbol={symbol}"
+
     try:
         r = requests.get(url, headers=NT_HEADERS, timeout=10)
-        r.raise_for_status()
         js = r.json()
-        # NiftyTrader returns {"status":"success", "data": {...}} on success in tests
-        if isinstance(js, dict) and js.get("status") in ("success", True, "ok"):
-            return js
-        # Some variants may contain data directly
-        if isinstance(js, dict) and "data" in js:
-            return js
-        return None
-    except Exception:
+
+        # Normalized JSON structure for your existing code
+        return {
+            "records": {
+                "expiryDates": js.get("expiryDates", []),
+                "data": js.get("records", {}).get("data", [])
+            }
+        }
+    except:
         return None
 
 def get_expiry_list(symbol: str):
-    """Extract expiry list from NiftyTrader response (or return [])."""
-    js = fetch_nt_oc(symbol)
+    js = fetch_oc_json(symbol)
     if not js:
         return []
+    return js["records"].get("expiryDates", [])
+
     try:
         # common key paths
         data = js.get("data", {})
